@@ -1,0 +1,259 @@
+#! /usr/bin/env python
+
+import array
+import png
+import sys
+
+
+class BitsBuffer:
+    def __init__(self):
+        self.bytes_lst = []
+        self.byte = 0
+        self.bits_in_byte = 0
+
+    def write(self, iterable):
+        for b in iterable:
+            self.write_bit(b)
+
+    def write_bit(self, b):
+        self.byte = (self.byte << 1) | b
+        self.bits_in_byte += 1
+        if self.bits_in_byte == 8:
+            self.bytes_lst.append(self.byte)
+            self.byte = 0
+            self.bits_in_byte = 0
+
+    def write_num(self, n, bits):
+        n_as_bits = [0] * bits + [int(c) for c in bin(n)[2:]]
+        self.write(n_as_bits[-bits:])
+
+    def finish_writing(self):
+        while self.bits_in_byte:
+            self.write_bit(0)
+
+        return array.array("B", self.bytes_lst)
+
+
+class BSKFormatImage:
+    data: array.array
+
+    def __init__(self, data):
+        self.data = data
+
+    @classmethod
+    def from_bitmap(cls, w, h, pixels):
+        return BSKFormatImage(BSKFormatEncoder().encode(w, h, pixels))
+
+    def tofile(self, f):
+        self.data.tofile(f)
+
+
+class PixelsIter:
+    __slots__ = ("pixels", "pos")
+
+    def __init__(self, pixels, pos=0):
+        self.pixels = pixels
+        self.pos = pos
+
+    def has_next(self):
+        return self.pos < len(self.pixels)
+
+    def get_next(self):
+        p = self.pixels[self.pos]
+        self.pos += 1
+        return p
+
+    def peek_next(self):
+        return self.pixels[self.pos]
+
+    def copy(self):
+        return PixelsIter(self.pixels, self.pos)
+
+    def advance(self, by=1):
+        self.pos += by
+
+
+def add_uint8(a, b):
+    return (a + b + 256) % 256
+
+
+def find_possible_2bit_diff_for_cmd_3(a, b):
+    for diff in (-2, -1, 0, 1):
+        if add_uint8(a, diff) == b:
+            return diff
+
+
+class Action:
+    __slots__ = ("cmd", "subwords", "new_rgb", "advance_by")
+
+    def __init__(self, cmd, subwords, new_rgb, advance_by=0):
+        self.cmd = cmd
+        self.subwords = subwords
+        self.new_rgb = new_rgb
+        self.advance_by = advance_by
+
+    def write(self, buffer):
+        buffer.write_num(self.cmd, 3)
+        for v, bits in self.subwords:
+            buffer.write_num(v, bits)
+
+    def cost(self):
+        return 3 + sum(bits for _, bits in self.subwords)
+
+
+class BSKFormatEncoder:
+    w: int
+    h: int
+    buffer: BitsBuffer
+
+    def diff(self, a, b):
+        if b >= a:
+            return b - a
+        return 256 - a + b
+
+    def encode(self, w, h, pixels):
+        self.w = w
+        self.h = h
+        self.buffer = BitsBuffer()
+
+        self.buffer.write_num(w, 24)
+        self.buffer.write_num(h, 24)
+
+        r, g, b = 0, 0, 0
+
+        it = PixelsIter(pixels)
+
+        while it.has_next():
+            for next_cmd in self.pick_next_action(it, r, g, b):
+                next_cmd.write(self.buffer)
+                r, g, b = next_cmd.new_rgb
+                it.advance(next_cmd.advance_by)
+
+        return self.buffer.finish_writing()
+
+    def make_6_7_1_actions(self, it, r, g, b):
+        pr, pg, pb = it.peek_next()
+        rdiff, gdiff, bdiff = self.diff(r, pr), self.diff(g, pg), self.diff(b, pb)
+
+        blen = max([rdiff.bit_length(), gdiff.bit_length(), bdiff.bit_length()])
+        if blen > 3:
+            blen, cmd = 8, 6
+        elif blen > 1:
+            blen, cmd = 3, 1
+        else:
+            blen, cmd = 1, 7
+
+        return Action(cmd, [(rdiff, blen), (gdiff, blen), (bdiff, blen)], (pr, pg, pb))
+
+    def make_3_action(self, original_it, r, g, b):
+        it = original_it.copy()
+        it.advance(1)
+        if not it.has_next():
+            return []
+
+        nr, ng, nb = it.get_next()
+        # try find (diff r, diff g, diff b) triple where each value is it -2..1 range
+        diff_r = find_possible_2bit_diff_for_cmd_3(r, nr)
+        diff_g = find_possible_2bit_diff_for_cmd_3(g, ng)
+        diff_b = find_possible_2bit_diff_for_cmd_3(b, nb)
+        if None in (diff_r, diff_g, diff_b):
+            return []
+
+        original_rgb = (r, g, b)
+        r, g, b = nr, ng, nb
+        advance_by = 2
+        while False and it.has_next():
+            nr, ng, nb = it.get_next()
+            if (
+                add_uint8(r, diff_r) != nr
+                or add_uint8(g, diff_g) != ng
+                or add_uint8(b, diff_b) != nb
+            ):
+                break
+
+            advance_by += 1
+            r, g, b = nr, ng, nb
+
+            if advance_by.bit_length() >= 7:
+                break
+
+        cmd_3 = Action(
+            3,
+            [(diff_r + 2, 2), (diff_g + 2, 2), (diff_b + 2, 2), (advance_by, 8)],
+            new_rgb=original_rgb,
+        )
+        if advance_by.bit_length() <= 4:
+            cmd_advance = Action(
+                0, [(advance_by, 4)], new_rgb=original_rgb, advance_by=advance_by
+            )
+        else:
+            cmd_advance = Action(
+                4, [(advance_by, 10)], new_rgb=original_rgb, advance_by=advance_by
+            )
+
+        cost = cmd_3.cost() + cmd_advance.cost()
+        it = original_it.copy()
+        it.advance(advance_by)
+        if it.has_next():
+            cost += self.make_6_7_1_actions(it, *original_rgb).cost()
+
+        alternative_cost = 0
+        r, g, b = original_rgb
+        it = original_it.copy()
+        for _ in range(advance_by):
+            if it.peek_next() != (r, g, b):
+                mcmd = self.make_6_7_1_actions(it, r, g, b)
+                alternative_cost += mcmd.cost()
+                r, g, b = mcmd.new_rgb
+            else:
+                it.advance()
+            alternative_cost += Action(2, [], (r, g, b)).cost()
+        if it.has_next():
+            alternative_cost += self.make_6_7_1_actions(it, r, g, b).cost()
+
+        if cost > alternative_cost:
+            return []
+
+        return [cmd_3, cmd_advance]
+
+    def pick_next_action(self, it, r, g, b):
+        if (r, g, b) != it.peek_next():
+            return [self.make_6_7_1_actions(it, r, g, b)]
+        else:
+            cmd_3 = self.make_3_action(it.copy(), r, g, b)
+            if cmd_3:
+                return cmd_3
+            return [Action(2, [], new_rgb=(r, g, b), advance_by=1)]
+
+
+def chunked(seq, size, trim):
+    return [seq[pos : pos + size][:trim] for pos in range(0, len(seq), size)]
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: ./img_convert input.png output.img")
+    with open(sys.argv[1], "rb") as input_file:
+        png_reader = png.Reader(file=input_file)
+        w, h, values, metadata = png_reader.read_flat()
+        print("Picture metadata", metadata)
+
+    if (
+        w == 0
+        or h == 0
+        or metadata.get("greyscale")
+        or metadata.get("bitdepth") != 8
+        or metadata["planes"] not in (3, 4)
+    ):
+        print(
+            "Invalid PNG file (w/h = 0 or grayscale or bitdepth != 8 or invalid planes num)"
+        )
+    else:
+        pixels = chunked(tuple(values), metadata["planes"], 3)
+        img = BSKFormatImage.from_bitmap(w, h, pixels)
+        with open(sys.argv[2], "wb") as f:
+            img.tofile(f)
+
+
+if __name__ == "__main__":
+    main()
